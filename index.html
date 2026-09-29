@@ -208,6 +208,10 @@
       </div>
       <div id="clist"></div>
     </div>
+    <div class="summary-grid">
+      <div class="box"><h3>Lifetime Stats</h3><div id="lifeStats" style="font-size:12px">Loading…</div></div>
+      <div class="box"><h3>Damage Leaderboard</h3><div id="lb" style="font-size:12px">Loading…</div></div>
+    </div>
     <div class="box" id="help">
       <b>How to play:</b> Pick a tower, click open ground to place it. Click a placed tower to upgrade or sell it, or drag it
       to a new tile to reposition it (each tower can be moved 3 times).
@@ -233,6 +237,9 @@
   <div class="note">The real one. Toggle it any time with <b>~</b> (shift+backtick) or by typing the code again.</div>
 </div>
 
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script>
 /*
   SAES TDS - tower defense where the staff are the towers.
@@ -725,6 +732,7 @@ function levelMods(lv) {
 const canvas = document.getElementById('c'), ctx = canvas.getContext('2d');
 let S;
 function newGame(idx = mapIndex, v = variant, mk = modeKey) {
+  cloudFlush();   // bank the previous run's totals before S is replaced
   mapIndex = idx; variant = v; modeKey = mk; buildMap(idx, v);
   canvas.classList.remove('party'); // in case a previous run left party mode on
   const M = MODE();
@@ -1096,6 +1104,7 @@ function gameOver(won) {
   S.over = true; S.won = won;
   const cleared = won ? S.wave : Math.max(0, S.wave - 1);
   saveBest(cleared);
+  cloudFlush(true); setTimeout(refreshLeaderboard, 1500);
   const best = S.towers.slice().sort((a, b) => b.totalDmg - a.totalDmg)[0];
   const mvp = best ? `<p>MVP: <b>${TOWERS[best.type].name}</b> — ${Math.round(best.totalDmg).toLocaleString()} damage.</p>` : '';
   const where = `${MODE().name} · ${MAPS[mapIndex].name}${variant === 'standard' ? '' : ' (' + VARIANTS[variant].name + ')'}`;
@@ -1558,6 +1567,7 @@ function renderCheats() {
     `<button data-c="${i}" class="${c.toggle && S.cheats[c.toggle] ? 'on' : ''}">${c.label}${c.toggle ? (S.cheats[c.toggle] ? ' ✓' : '') : ''}</button>`).join('');
   g.querySelectorAll('button').forEach(b => b.onclick = () => {
     const c = CHEATS[+b.dataset.c];
+    cloudFlush(); S.tainted = true;   // cheated run: stop counting it
     if (c.toggle) S.cheats[c.toggle] = !S.cheats[c.toggle];
     if (c.act) c.act();
     renderCheats(); renderShop(); renderInfo(); updateHUD();
@@ -1600,6 +1610,7 @@ function renderCheats2() {
     `<button data-c="${i}" class="${c.toggle && S.cheats[c.toggle] ? 'on' : ''}">${c.label}${c.toggle ? (S.cheats[c.toggle] ? ' ✓' : '') : ''}</button>`).join('');
   g.querySelectorAll('button').forEach(b => b.onclick = () => {
     const c = CHEATS2[+b.dataset.c];
+    cloudFlush(); S.tainted = true;   // cheated run: stop counting it
     if (c.toggle) S.cheats[c.toggle] = !S.cheats[c.toggle];
     if (c.act) c.act();
     renderCheats2(); renderCheats(); renderShop(); renderInfo(); updateHUD();
@@ -1883,6 +1894,7 @@ async function postComment() {
   const text = box.value.trim().slice(0, 200);
   if (!text) return;
   const row = { name: ANON, text, ts: Date.now() };
+  if (cloudState) row.uid = cloudState.uid;
   box.value = '';
   document.getElementById('ccount').textContent = '200';
   btn.disabled = true;
@@ -1920,18 +1932,107 @@ function setupComments() {
   mine = localComments();
   renderComments(mine);
 
-  // If this view has a shared store, switch over to it and follow it live.
-  if (typeof claude === 'undefined' || !claude.use) return;
-  claude.use('db').then(db => {
-    if (!db) return;
-    cdb = db;
-    db.collection('comments').orderBy('ts', 'desc').limit(50).onSnapshot(
-      snap => renderComments(snap.docs.map(d => d.data())),
-      () => { cdb = null; renderComments(mine); },
-    );
-  }).catch(() => { /* no shared store, local list stays */ });
 }
 setupComments();
+
+/* ---- cloud: lifetime stats + leaderboard + live comments (Firebase) ----
+   Paste your firebaseConfig below. It's fine for this to be public - the
+   Firestore security rules are what protect the data. If the SDK can't load or
+   the config is empty, everything falls back to offline mode. */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCrqXDR1DvHhYuSk97CpW4pF1kq0QCrBF0",
+  authDomain: "saes-tds.firebaseapp.com",
+  projectId: "saes-tds",
+  storageBucket: "saes-tds.firebasestorage.app",
+  messagingSenderId: "997396377729",
+  appId: "1:997396377729:web:996f804d0b4bb7c438dd80",
+  measurementId: "G-ZDWTQL13FG"
+};
+
+let cloudState = null;                       // { db, uid } once signed in
+const ZERO = () => ({ damage: 0, goldWon: 0, enemiesDefeated: 0, goldSpent: 0 });
+let seenTotals = ZERO(), seenRef = null;
+
+// Sends only what changed since the last flush, so nothing is double-counted.
+// Runs that used the cheat menus are marked S.tainted and never counted.
+function cloudFlush(finished) {
+  if (!cloudState || typeof S === 'undefined' || !S || S.tainted) return;
+  if (S.totals !== seenRef) { seenRef = S.totals; seenTotals = ZERO(); }   // new run started
+  const d = {}; let any = !!finished;
+  for (const k in seenTotals) { d[k] = Math.round(S.totals[k] - seenTotals[k]); if (d[k] > 0) any = true; }
+  if (!any) return;
+  for (const k in d) seenTotals[k] += d[k];
+  const F = firebase.firestore.FieldValue;
+  cloudState.db.collection('players').doc(cloudState.uid).set({
+    name: ANON,
+    totalDamage: F.increment(d.damage),
+    goldWon: F.increment(d.goldWon),
+    enemiesDefeated: F.increment(d.enemiesDefeated),
+    goldSpent: F.increment(d.goldSpent),
+    runs: F.increment(finished ? 1 : 0),
+    updatedAt: F.serverTimestamp(),
+  }, { merge: true }).catch(() => { for (const k in d) seenTotals[k] -= d[k]; });   // retry next flush
+}
+
+function renderLifetime(p) {
+  p = p || {};
+  const n = v => Math.round(+v || 0).toLocaleString();
+  const el = document.getElementById('lifeStats');
+  el.innerHTML = `
+    <div class="row"><span>Total damage</span><b>${n(p.totalDamage)}</b></div>
+    <div class="row"><span>Gold won</span><b>${n(p.goldWon)}g</b></div>
+    <div class="row"><span>Enemies defeated</span><b>${n(p.enemiesDefeated)}</b></div>
+    <div class="row"><span>Gold spent</span><b>${n(p.goldSpent)}g</b></div>
+    <div class="row"><span>Runs finished</span><b>${n(p.runs)}</b></div>`;
+  el.querySelectorAll('.row').forEach(r => {
+    r.style.cssText = 'display:flex;justify-content:space-between;gap:6px;border-bottom:1px dotted var(--line);padding:2px 0';
+  });
+}
+
+async function refreshLeaderboard() {
+  if (!cloudState) return;
+  const el = document.getElementById('lb');
+  try {
+    const snap = await cloudState.db.collection('players').orderBy('totalDamage', 'desc').limit(10).get();
+    el.textContent = '';
+    let i = 0;
+    snap.forEach(doc => {
+      const p = doc.data(), row = document.createElement('div');
+      row.style.cssText = 'display:flex;justify-content:space-between;gap:6px;border-bottom:1px dotted var(--line);padding:2px 0';
+      if (doc.id === cloudState.uid) row.style.color = 'var(--red)';
+      const a = document.createElement('span'), b = document.createElement('b');
+      a.textContent = `${++i}. ${p.name || 'Anon'}`;               // textContent: names are untrusted
+      b.textContent = Math.round(p.totalDamage || 0).toLocaleString();
+      row.append(a, b); el.appendChild(row);
+    });
+    if (!i) el.textContent = 'No scores yet.';
+  } catch (e) { el.textContent = 'Leaderboard unavailable.'; }
+}
+
+function setupCloud() {
+  const life = document.getElementById('lifeStats'), lb = document.getElementById('lb');
+  const offline = msg => { life.textContent = msg; lb.textContent = msg; };
+  if (typeof firebase === 'undefined' || !FIREBASE_CONFIG.projectId) { offline('Cloud features are offline.'); return; }
+  try {
+    firebase.initializeApp(FIREBASE_CONFIG);
+    const auth = firebase.auth(), db = firebase.firestore();
+    auth.onAuthStateChanged(u => {
+      if (!u || cloudState) return;
+      cloudState = { db, uid: u.uid };
+      cdb = db;                                                        // comments go live
+      db.collection('comments').orderBy('ts', 'desc').limit(50)
+        .onSnapshot(snap => renderComments(snap.docs.map(d => d.data())), () => {});
+      db.collection('players').doc(u.uid).onSnapshot(d => renderLifetime(d.data()));
+      refreshLeaderboard();
+    });
+    auth.signInAnonymously().catch(() => offline('Cloud sign-in failed.'));
+  } catch (e) { offline('Cloud features are offline.'); }
+}
+setupCloud();
+setInterval(() => cloudFlush(), 30000);
+setInterval(refreshLeaderboard, 60000);
+document.addEventListener('visibilitychange', () => { if (document.hidden) cloudFlush(); });
+addEventListener('pagehide', () => cloudFlush());
 
 // go
 let last = performance.now();
